@@ -1,12 +1,15 @@
 """Windows x64 pointer provenance debugger for authorized test processes.
 Install: python -m pip install pymem capstone
-Run: python -u main_v5.py | python main_v5.py --self-test
-Optional: python -u main_v5.py --record-from HEX_ADDRESS --watch HEX_ADDRESS
+Run: python -u main_v6_types_scan.py | python main_v6_types_scan.py --self-test
+Value formats: python main_v6_types_scan.py --list-types
 """
 import argparse
+from bisect import bisect_left
+import codecs
+from collections import defaultdict
 import ctypes as C
 from dataclasses import dataclass, field
-import faulthandler
+from decimal import Decimal, localcontext
 import math
 import os
 import re
@@ -14,6 +17,7 @@ import struct
 import sys
 import tempfile
 import time
+from typing import Callable
 
 MASK = (1 << 64) - 1
 AMD64 = 0x8664
@@ -113,6 +117,263 @@ def read_exact(pm, address, size):
 
 def u64(pm, address):
     return struct.unpack('<Q', read_exact(pm, address, 8))[0]
+
+
+MAX_VALUE_BYTES = 1 << 20
+VALUE_FORMATS = """Value formats for --type (default: auto):
+  auto                       raw bytes from the watch address to the end of the access
+  all                        raw bytes and common scalar interpretations that fit
+  i8/u8 ... i128/u128        signed/unsigned integers; any positive multiple of 8 bits
+  f16, bf16, f32, f64        binary16, bfloat16, binary32, binary64
+  f80, f128                  x87 80-bit extended and IEEE binary128
+  bool, bool32               1-byte bool and 4-byte Windows BOOL
+  ptr, ptr32                 64-bit and 32-bit hexadecimal pointer values
+  char, wchar                single byte, UTF-16 code unit
+  bytes[N]                   raw bytes (aob[N] also works)
+  bits[OFFSET:WIDTH]         unsigned bit field (sbits[...] for signed)
+  ascii[N], latin1[N]        fixed-size single-byte strings
+  utf8[N], utf16[N], utf32[N] fixed-size strings; N counts code units
+  cstr[N], cutf16[N], ...    NUL-terminated strings with a maximum of N code units
+  text:ENCODING[N]           custom text encoding; ctext:... stops at NUL
+  TYPE[N]                    fixed-size array, e.g. f32[3] or u16[3][2]
+  struct:FORMAT              Python struct layout, e.g. struct:<ifB3x
+  none                       show only the pointer chain
+Use --endian big for big-endian values; little-endian is the default.
+Aliases include byte, word, dword, qword, short, int, long, float, double, pointer, str[N].
+Explicit values are read from the watch address before the instruction runs.
+Fixed-size reads support up to 1 MiB.
+"""
+
+
+@dataclass(frozen=True)
+class ValueType:
+    name: str
+    size: int | None
+    decode: Callable[[bytes], str]
+    nul_unit: int = 0
+    match_size: int | None = None
+    match_offset: int = 0
+
+    def __post_init__(self):
+        if self.size is not None and not 1 <= self.size <= MAX_VALUE_BYTES:
+            raise ValueError(f'Type size must be between 1 and {MAX_VALUE_BYTES:,} bytes')
+
+    @property
+    def watch_range(self):
+        return self.match_size or self.size or 1, self.match_offset
+
+
+def format_integer(value):
+    # Python limits conversion of very large integers to decimal strings.
+    return str(value) if value.bit_length() <= 4096 else hex(value)
+
+
+def format_float(value, digits):
+    if math.isnan(value) and math.copysign(1, value) < 0:
+        return '-nan'
+    if not math.isfinite(value) or value == 0:
+        return repr(value)
+    return format(value, f'.{digits}g')
+
+
+def format_extended_float(data, order, fraction_bits, explicit_integer):
+    bits = int.from_bytes(data, order)
+    width = fraction_bits + int(explicit_integer)
+    fraction = bits & ((1 << fraction_bits) - 1)
+    significand = bits & ((1 << width) - 1)
+    exponent = (bits >> width) & 0x7fff
+    sign = '-' if bits >> (width + 15) else ''
+    if explicit_integer and exponent and not significand >> fraction_bits:
+        return f'unsupported x87 encoding (0x{bits:020X})'
+    if exponent == 0x7fff:
+        return sign + ('nan' if fraction else 'inf')
+    if exponent and not explicit_integer:
+        significand |= 1 << fraction_bits
+    if not significand:
+        return sign + '0.0'
+    with localcontext() as context:
+        digits = 21 if explicit_integer else 36
+        context.prec = digits + 16
+        value = Decimal(significand) * Decimal(2) ** (max(1, exponent) - 16383 - fraction_bits)
+        return sign + format(value, f'.{digits}g')
+
+
+TYPE_ALIASES = {
+    'byte': 'u8', 'word': 'u16', 'dword': 'u32', 'qword': 'u64',
+    '1byte': 'u8', '2bytes': 'u16', '4bytes': 'u32', '8bytes': 'u64',
+    'sbyte': 'i8', 'short': 'i16', 'ushort': 'u16', 'int': 'i32', 'uint': 'u32',
+    'long': 'i32', 'ulong': 'u32', 'longlong': 'i64', 'ulonglong': 'u64',
+    'size_t': 'u64', 'intptr': 'i64', 'uintptr': 'u64', 'pointer': 'ptr', 'ptr64': 'ptr',
+    'half': 'f16', 'float': 'f32', 'single': 'f32', 'double': 'f64',
+    'bfloat16': 'bf16', 'x87': 'f80', 'quad': 'f128', 'boolean': 'bool',
+}
+TEXT_TYPES = {
+    'char': ('latin-1', 1), 'ascii': ('ascii', 1), 'latin1': ('latin-1', 1),
+    'str': ('utf-8', 1), 'utf8': ('utf-8', 1), 'wchar': ('utf-16', 2),
+    'utf16': ('utf-16', 2), 'utf32': ('utf-32', 4),
+}
+BINARY_FLOATS = {
+    'f16': ('e', 2, 5), 'f32': ('f', 4, 9), 'f64': ('d', 8, 17), 'bf16': ('f', 2, 9),
+}
+
+
+def normalized_name(text):
+    return ''.join(text.lower().split())
+
+
+def format_bytes(data):
+    return data.hex(' ').upper()
+
+
+def text_type(name, encoding, unit, count, order, terminated):
+    if encoding in ('utf-16', 'utf-32'):
+        encoding += '-le' if order == 'little' else '-be'
+
+    def decode(data):
+        if terminated:
+            sentinel = bytes(unit)
+            end = next((i for i in range(0, len(data), unit) if data[i:i + unit] == sentinel), len(data))
+            data = data[:end]
+        return repr(data.decode(encoding, errors='backslashreplace'))
+
+    return ValueType(name, count * unit, decode, unit if terminated else 0)
+
+
+def parse_value_type(text, order='little'):
+    text = text.strip()
+    endian = '<' if order == 'little' else '>'
+    array = re.fullmatch(r'(.+)\[\s*([0-9]+)\s*\]', text)
+    if array is None and text.lower().startswith('struct:'):
+        layout = text.split(':', 1)[1].strip()
+        if not layout:
+            raise ValueError('struct: requires a Python struct format')
+        try:
+            fmt = struct.Struct(layout if layout[0] in '@=<>!' else endian + layout)
+        except struct.error as error:
+            raise ValueError(str(error)) from error
+        return ValueType('struct:' + fmt.format, fmt.size, lambda data: repr(fmt.unpack(data)))
+
+    name = normalized_name(text)
+    name = TYPE_ALIASES.get(name, name)
+    if name == 'none':
+        return None
+    if name == 'auto':
+        return ValueType('auto', None, format_bytes)
+    if name == 'all':
+        scalars = [parse_value_type(item, order) for item in
+                   'bool bool32 u8 i8 u16 i16 u32 i32 u64 i64 u128 i128 f16 bf16 f32 f64 f80 f128 ptr32 ptr'.split()]
+
+        def interpretations(data):
+            values = [f'{item.name}={item.decode(data[:item.size])}' for item in scalars
+                      if item.size <= len(data)]
+            return format_bytes(data) + ' | ' + ', '.join(values)
+
+        return ValueType('all', None, interpretations)
+
+    integer = re.fullmatch(r'(i|int|u|uint)([0-9]+)', name)
+    if integer:
+        kind, width = integer.groups()
+        bits = int(width)
+        if bits <= 0 or bits % 8:
+            raise ValueError('Integer width must be a positive multiple of 8 bits')
+        signed_value = kind in ('i', 'int')
+        return ValueType(('i' if signed_value else 'u') + str(bits), bits // 8,
+                         lambda data: format_integer(int.from_bytes(data, order, signed=signed_value)))
+
+    if re.fullmatch(r'float[0-9]+', name):
+        name = 'f' + name[5:]
+    if name in BINARY_FLOATS:
+        code, size, digits = BINARY_FLOATS[name]
+
+        def decode_float(data):
+            if name == 'bf16':
+                data = (int.from_bytes(data, order) << 16).to_bytes(4, order)
+            return format_float(struct.unpack(endian + code, data)[0], digits)
+
+        return ValueType('float' + name[1:] if name != 'bf16' else name, size, decode_float)
+    if name in ('f80', 'f128'):
+        explicit = name == 'f80'
+        return ValueType('float' + name[1:], 10 if explicit else 16,
+                         lambda data: format_extended_float(data, order, 63 if explicit else 112, explicit))
+    if name in ('bool', 'bool32'):
+        return ValueType(name, 1 if name == 'bool' else 4,
+                         lambda data: 'true' if any(data) else 'false')
+    if name in ('ptr32', 'ptr'):
+        size = 4 if name == 'ptr32' else 8
+        return ValueType(name, size, lambda data: f'0x{int.from_bytes(data, order):0{size * 2}X}')
+    if name in ('char', 'wchar'):
+        encoding, unit = TEXT_TYPES[name]
+        return text_type(name, encoding, unit, 1, order, False)
+
+    field = re.fullmatch(r'(s?)bits\[([0-9]+):([0-9]+)\]', name)
+    if field:
+        sign, start, length = field.groups()
+        offset, width = int(start), int(length)
+        if width <= 0:
+            raise ValueError('Bit-field width must be positive')
+
+        def decode_field(data):
+            value = (int.from_bytes(data, order) >> offset) & ((1 << width) - 1)
+            if sign and value >> (width - 1):
+                value -= 1 << width
+            return format_integer(value)
+
+        size = (offset + width + 7) // 8
+        skip = offset // 8
+        return ValueType(name, size, decode_field, match_size=size - skip,
+                         match_offset=skip if order == 'little' else 0)
+
+    if array:
+        element, amount = array.groups()
+        count = int(amount)
+        key = normalized_name(element)
+        if key.startswith(('text:', 'ctext:')):
+            kind, codec = key.split(':', 1)
+            try:
+                encoding = codecs.lookup(codec).name
+                b''.decode(encoding)
+            except LookupError as error:
+                raise ValueError(f'Unknown text encoding {codec!r}') from error
+            unit = 2 if encoding.startswith('utf-16') else 4 if encoding.startswith('utf-32') else 1
+            return text_type(name, encoding, unit, count, order, kind == 'ctext')
+        if key in ('bytearray', 'bytes', 'aob', 'raw'):
+            return ValueType(f'bytes[{count}]', count, format_bytes)
+        terminated = key.startswith('c') and key[1:] in TEXT_TYPES
+        codec = key[1:] if terminated else key
+        if codec in TEXT_TYPES:
+            encoding, unit = TEXT_TYPES[codec]
+            return text_type(name, encoding, unit, count, order, terminated)
+        item = parse_value_type(element, order)
+        if item is None or item.size is None:
+            raise ValueError('Array element must have a fixed size')
+        return ValueType(f'{item.name}[{count}]', count * item.size,
+                         lambda data: '[' + ', '.join(item.decode(data[i:i + item.size])
+                                                      for i in range(0, len(data), item.size)) + ']')
+    raise ValueError(f'Unknown value type {text!r}. Use --list-types for supported formats.')
+
+
+def read_value(pm, address, spec, size):
+    if not 0 <= address <= MASK or not 0 < size <= MAX_VALUE_BYTES or address + size > MASK + 1:
+        raise TraceError('Invalid value read range')
+    if not spec.nul_unit:
+        return spec.decode(read_exact(pm, address, size))
+    # A string ending just before an unreadable page is still readable.
+    data = bytearray()
+    unit = spec.nul_unit
+    sentinel = bytes(unit)
+    while len(data) < size:
+        cursor = address + len(data)
+        block_size = min(256, size - len(data))
+        try:
+            block = read_exact(pm, cursor, block_size)
+        except Exception:
+            block = read_exact(pm, cursor, unit)
+        for offset in range(0, len(block), unit):
+            piece = block[offset:offset + unit]
+            if piece == sentinel:
+                return spec.decode(bytes(data))
+            data.extend(piece)
+    return spec.decode(bytes(data))
 
 
 # No pefile, disk PE parsing or full .pdata enumeration.
@@ -335,6 +596,18 @@ def leaves(expr):
         yield from leaves(expr[2])
 
 
+def stack_loads(expr):
+    kind = expr[0]
+    if kind == 'load':
+        address = expr[2]
+        if address[0] == 'stack':
+            yield address[1]
+        yield from stack_loads(address)
+    elif kind not in ('const', 'stack', 'reg', 'unknown'):
+        yield from stack_loads(expr[1])
+        yield from stack_loads(expr[2])
+
+
 def evaluate(expr, pm, regs=None):
     kind = expr[0]
     if kind in ('const', 'stack'):
@@ -407,6 +680,9 @@ MAX_PATHS = 12
 MAX_PATH_LENGTH = 4096
 MAX_CFG_NODES = 32768
 MAX_PATH_EXPANSIONS = 60000
+MAX_INLINE_DEPTH = 6
+MAX_INLINE_ATTEMPTS = 128
+LEAF_WINDOW = 0x400
 
 
 class ProvenanceAnalyzer(Decoder):
@@ -497,7 +773,8 @@ class ProvenanceAnalyzer(Decoder):
             addr = self.address(ins, op, stack)
             stores.append((op.size, addr, self.key(addr, live), cut(value, width)))
 
-    def transfer(self, ins, expr, stack=None, live=None, recorded=False, next_regs=None):
+    def transfer(self, ins, expr, stack=None, live=None, recorded=False, next_regs=None,
+                 conditional=None):
         m, ops = ins.mnemonic.lower(), ins.operands
         rep, stores = {}, []
         def src(op):
@@ -512,7 +789,7 @@ class ProvenanceAnalyzer(Decoder):
             if not m.startswith('loop'):
                 return expr
         if m in ('mov', 'movabs', 'movzx', 'movsx', 'movsxd', 'lea') and len(ops) == 2:
-            val = self.address(ins, ops[1], None) if m == 'lea' else src(ops[1])
+            val = self.address(ins, ops[1], stack) if m == 'lea' else src(ops[1])
             if m in ('movsx', 'movsxd'):
                 val = extend(val, ops[1].size * 8)
             put(ops[0], val)
@@ -541,10 +818,9 @@ class ProvenanceAnalyzer(Decoder):
             if recorded and live is not None and next_regs is not None:
                 # Select by actual pre-instruction flags instead of comparing equal values.
                 flags = live.get('eflags')
-                cond = condition(m[4:], flags) if flags is not None else None
-                put(ops[0],src(ops[1]) if cond is True else src(ops[0]) if cond is False else U(m))
-            else:
-                put(ops[0],U(f'{m}: conditional data flow; use recording'))
+                conditional = condition(m[4:], flags) if flags is not None else None
+            put(ops[0], src(ops[1]) if conditional is True else
+                src(ops[0]) if conditional is False else U(f'{m}: conditional data flow'))
             handled = True
         elif m == 'push' and len(ops)==1:
             size = 2 if ops[0].size==2 else 8
@@ -602,12 +878,21 @@ class ProvenanceAnalyzer(Decoder):
                     put(op,U(f'{m} memory write'))
         output = rewrite(expr,rep,stores)
         if output != expr:
-            log(f'0x{ins.address:X}: {m} {ins.op_str}  =>  {render(output,self.modules)}')
+            message=f'0x{ins.address:X}: {m} {ins.op_str}  =>  {render(output,self.modules)}'
+            seen=getattr(self,'trace_messages',None)
+            if seen is None or (message not in seen and len(seen)<MAX_INSNS):
+                log(message)
+                if seen is not None:
+                    seen.add(message)
         return output
 
-    def stack_coordinates(self, instructions, endpoint_rsp):
+    def stack_coordinates(self, instructions, endpoint_rsp=None, *, entry_rsp=None,
+                          entry_coordinates=None):
         """Normalize RSP/RBP and stack-derived registers to entry-RSP offsets."""
         coords = {'rsp': 0}
+        if entry_rsp is not None:
+            coords.update({name: value[1] - entry_rsp for name, value in
+                           (entry_coordinates or {}).items() if name != 'rsp'})
         snapshots = []
         for ins in instructions:
             self.budget.check('stack coordinate tracking')
@@ -649,18 +934,17 @@ class ProvenanceAnalyzer(Decoder):
                     if mask in (MASK^7,MASK^15):
                         align=(MASK^mask)+1
                         coords[dst]=old[dst]-((8+old[dst])%align)
-        if endpoint_rsp is None or 'rsp' not in coords:
+        if entry_rsp is None and (endpoint_rsp is None or 'rsp' not in coords):
             return [{} for _ in instructions], None
-        entry = endpoint_rsp - coords['rsp']
+        entry = entry_rsp if entry_rsp is not None else endpoint_rsp - coords['rsp']
         return [{r:stackaddr(entry+d) for r,d in snap.items()} for snap in snapshots], entry
 
-    def paths(self, start, endpoint, end):
-        """Build a reachable CFG, then enumerate bounded predecessors backward."""
-        from collections import defaultdict
-        if not start <= endpoint < end or end-start>MAX_CODE:
+    def graph(self, start, end, endpoint=None, *, leaf=False):
+        if not start < end <= start + MAX_CODE or endpoint is not None and not start <= endpoint < end:
             raise TraceError('Invalid or oversized CFG range')
-        data=read_exact(self.pm,start,end-start)
+        data=None if leaf else read_exact(self.pm,start,end-start)
         pending=[start]; decoded={}; predecessors=defaultdict(list); seen=set()
+        exits=[]
         truncated=False
         while pending:
             self.budget.check('CFG construction')
@@ -672,30 +956,50 @@ class ProvenanceAnalyzer(Decoder):
                 truncated=True; break
             if pc==endpoint:
                 continue
-            ins=next(self.md.disasm(data[pc-start:pc-start+15],pc,count=1),None)
+            if leaf:
+                try:
+                    ins=self.instruction(pc)
+                except (TraceError, KeyError):
+                    truncated=True
+                    continue
+            else:
+                ins=next(self.md.disasm(data[pc-start:pc-start+15],pc,count=1),None)
             if ins is None:
+                truncated=True
                 continue
             decoded[pc]=ins
             nxt=pc+ins.size
             if ins.group(self.ret) or ins.mnemonic in ('int3','ud2','hlt'):
                 successors=[]
+                if ins.mnemonic == 'ret':
+                    exits.append(ins)
             elif ins.group(self.jump) or ins.mnemonic.startswith('loop'):
                 direct=bool(ins.operands and ins.operands[0].type==self.imm_op)
                 successors=[ins.operands[0].imm] if direct else []
                 if ins.mnemonic not in ('jmp','ljmp'):
                     successors.append(nxt)
-                if not direct:
+                if ins.mnemonic == 'jmp' and (not direct or not start <= successors[0] < end):
+                    exits.append(ins)
+                if not direct or any(not start <= dest < end for dest in successors):
                     truncated=True
             else:
                 successors=[nxt]
-            for dest in set(successors):
+            for dest in dict.fromkeys(successors):
                 if start<=dest<end:
                     predecessors[dest].append(pc)
                     if dest not in seen:
                         pending.append(dest)
+        return decoded,predecessors,exits,truncated
+
+    def paths(self, start, endpoint, end):
+        """Build a reachable CFG, then enumerate bounded predecessors backward."""
+        decoded,predecessors,_,truncated=self.graph(start,end,endpoint)
         log(f'[cfg] {len(decoded):,} reachable instructions; reverse path search')
         if truncated:
-            log('[?] CFG incomplete (indirect jump or node limit)')
+            log('[?] CFG incomplete (undecodable code, external/indirect branch, or node limit)')
+        yield from self.predecessor_paths(start,endpoint,decoded,predecessors)
+
+    def predecessor_paths(self,start,endpoint,decoded,predecessors):
         work=[(endpoint,())]; expansions=0; emitted=0
         while work and emitted<MAX_PATHS and expansions<MAX_PATH_EXPANSIONS:
             self.budget.check('CFG predecessor search')
@@ -711,6 +1015,118 @@ class ProvenanceAnalyzer(Decoder):
                     work.append((pred,reverse+(pred,)))
         if work:
             log('[?] CFG path budget reached; other paths may exist')
+
+    def branch_target(self, ins, prefix, snapshots):
+        if not ins.operands:
+            return None
+        expr=self.source(ins,ins.operands[0],snapshots[-1],None)
+        for earlier,stack in zip(reversed(prefix),reversed(snapshots[:-1])):
+            if not any(part[0]=='reg' for part in leaves(expr)) and next(stack_loads(expr),None) is None:
+                break
+            self.budget.check('indirect call target')
+            expr=self.transfer(earlier,expr,stack)
+        try:
+            return evaluate(expr,self.pm)
+        except Exception:
+            return None
+
+    def return_values(self, destination, expr, entry_rsp, coordinates, active):
+        if destination in active or len(active)>=MAX_INLINE_DEPTH or self.inline_attempts>=MAX_INLINE_ATTEMPTS:
+            return
+        self.inline_attempts+=1
+        self.budget.check('callee analysis')
+        if destination not in self.callee_graphs:
+            bounds=self.table.find(destination)
+            if bounds:
+                self.callee_graphs[destination]=self.graph(destination,bounds[1])
+            else:
+                module=containing(self.modules,destination)
+                end=min(destination+LEAF_WINDOW,module.base+module.size) if module else destination+LEAF_WINDOW
+                self.callee_graphs[destination]=self.graph(destination,end,leaf=True)
+        decoded,predecessors,exits,_=self.callee_graphs[destination]
+        active=active+(destination,)
+        attempts=0
+        for terminal in sorted(exits,key=lambda ins: ins.address):
+            for path in self.predecessor_paths(destination,terminal.address,decoded,predecessors):
+                if attempts>=MAX_PATHS:
+                    return
+                attempts+=1
+                # At a Win64 near RET or tail jump, the callee must have restored its stack.
+                snapshots,_=self.stack_coordinates(path+[terminal],entry_rsp=entry_rsp,
+                    entry_coordinates=coordinates)
+                if entry_rsp is not None and snapshots[-1].get('rsp')!=stackaddr(entry_rsp):
+                    continue
+                if terminal.mnemonic=='ret':
+                    if terminal.operands:
+                        continue
+                    current=self.transfer(terminal,expr,snapshots[-1],recorded=True)
+                else:
+                    tail=self.branch_target(terminal,path,snapshots)
+                    if not tail:
+                        continue
+                    for current in self.return_values(tail,expr,entry_rsp,snapshots[-1],active):
+                        yield from self.rewind(path,snapshots[:-1],current,active)
+                    continue
+                yield from self.rewind(path,snapshots[:-1],current,active)
+
+    def call_affects(self, expr, stack):
+        if any(part[0]=='reg' and part[1] in VOLATILE for part in leaves(expr)):
+            return True
+        if 'rsp' not in stack:
+            return False
+        rsp=stack['rsp'][1]
+        out_args={stack[name][1] for name in ARGUMENTS if name in stack}
+        return any(address in out_args or (rsp<=address and (address<rsp+32 or out_args))
+                   for address in stack_loads(expr))
+
+    def rewind(self,path,snapshots,expr,active=(),live=None):
+        candidates=[expr]
+        surviving={name:K(value) for name,value in (live or {}).items()
+                   if name in REGS and name not in ('rsp','rip')}
+        for i in range(len(path)-1,-1,-1):
+            self.budget.check('backward symbolic trace')
+            ins,stack=path[i],snapshots[i]
+            if surviving:
+                _,written=ins.regs_access()
+                for ident in written:
+                    name=ins.reg_name(ident)
+                    surviving.pop(ALIASES.get(name,name),None)
+                if ins.mnemonic=='call':
+                    for name in VOLATILE:
+                        surviving.pop(name,None)
+            next_candidates=[]
+            for current in candidates:
+                values=[]
+                if ins.mnemonic=='call' and self.call_affects(current,stack):
+                    try:
+                        destination=self.branch_target(ins,path[:i],snapshots[:i+1])
+                        if destination:
+                            log(f'[call] 0x{ins.address:X} -> {label(self.modules,destination)}; tracing return paths')
+                            entry=stack['rsp'][1]-8 if 'rsp' in stack else None
+                            for value in self.return_values(destination,current,entry,stack,active):
+                                values.append(self.transfer(ins,value,stack,recorded=True))
+                                if len(values)>=MAX_PATHS:
+                                    break
+                    except Exception as error:
+                        log(f'[call] Incomplete callee trace: {error}')
+                elif ins.mnemonic.startswith('cmov'):
+                    values=[self.transfer(ins,current,stack,conditional=choice) for choice in (False,True)]
+                if not values:
+                    values=[self.transfer(ins,current,stack)]
+                for value in values:
+                    if value not in next_candidates:
+                        next_candidates.append(value)
+                    if len(next_candidates)>=MAX_PATHS:
+                        break
+                if len(next_candidates)>=MAX_PATHS:
+                    break
+            candidates=next_candidates
+            if surviving:
+                for value in candidates:
+                    names={part[1] for part in leaves(value) if part[0]=='reg'}
+                    if names and names<=surviving.keys() and next(stack_loads(value),None) is not None:
+                        self.remember_partial(rewrite(value,surviving,[]))
+        yield from candidates
 
     def caller_sites(self, return_address):
         bounds=self.table.find(return_address-1)
@@ -751,7 +1167,7 @@ class ProvenanceAnalyzer(Decoder):
             raise TraceError('Memory access range wraps around')
         return ins,expr,start,width
 
-    def target_expr(self, target, regs, watch=None):
+    def target_expr(self, target, regs, watch=None, watch_size=1, watch_offset=0):
         ins,expr,start,width=self.access_info(target,regs)
         log(f'[target] 0x{target:X}: {ins.mnemonic} {ins.op_str}')
         log(f'Effective address: 0x{start:X}')
@@ -759,11 +1175,14 @@ class ProvenanceAnalyzer(Decoder):
         log(f'Access range: 0x{start:X}..0x{start+width-1:X}')
         if watch is None:
             return expr,start
-        delta=watch_delta(start,width,watch)
+        delta=watch_delta(start,width,watch,watch_size,watch_offset)
         if delta is None:
-            raise TraceError('Watch address is outside the access range')
+            raise TraceError('Watch range does not overlap the memory access')
         log(f'Watch address: 0x{watch:X}')
-        log(f'Access offset: +0x{delta:X}')
+        if watch_size>1 or watch_offset:
+            first=watch+watch_offset
+            log(f'Watch range: 0x{first:X}..0x{first+watch_size-1:X}')
+        log(f'Access offset: {fmt_offset(delta)}')
         return B('add',expr,K(delta)),watch
 
     def inspect_candidate(self, expr, expected):
@@ -790,8 +1209,17 @@ class ProvenanceAnalyzer(Decoder):
             log('[!] No validated module-relative root found')
         log(f'[?] {mode}; snapshot match is not proof of future stability')
 
-    def trace(self, frames, regs, target, manual_start, watch=None):
-        expr,expected=self.target_expr(target,regs,watch)
+    def remember_partial(self, expr):
+        if any(part[0]=='stack' for part in leaves(expr)) and expr not in self.scan_partials:
+            self.scan_partials.append(expr)
+            self.scan_partials=self.scan_partials[-MAX_PATHS:]
+
+    def trace(self, frames, regs, target, manual_start, watch=None, watch_size=1, watch_offset=0):
+        expr,expected=self.target_expr(target,regs,watch,watch_size,watch_offset)
+        self.callee_graphs={}
+        self.inline_attempts=0
+        self.trace_messages=set()
+        self.scan_partials=[]
         candidates=[expr]; best=expr
         for i,frame in enumerate(frames):
             self.budget.check('frame traversal')
@@ -814,27 +1242,24 @@ class ProvenanceAnalyzer(Decoder):
                     snapshots,entry=self.stack_coordinates(path,frame.get('rsp'))
                     log(f'[path #{attempted}] {len(path)} instructions; entry RSP={entry!r}')
                     for candidate in candidates:
-                        current=candidate
                         try:
-                            for ins,stack in zip(reversed(path),reversed(snapshots)):
-                                self.budget.check('backward symbolic trace')
-                                current=self.transfer(ins,current,stack)
-                            if entry is not None:
-                                current=rewrite(current,{'rsp':stackaddr(entry)},[])
+                            for current in self.rewind(path,snapshots,candidate,(start,),regs if i==0 else None):
+                                if entry is not None:
+                                    current=rewrite(current,{'rsp':stackaddr(entry)},[])
+                                best=current
+                                if self.inspect_candidate(current,expected):
+                                    self.report(current,expected,True,'Static CFG path candidate')
+                                    return True
+                                self.remember_partial(current)
+                                parts=list(leaves(current))
+                                if any(x[0]=='unknown' for x in parts):
+                                    continue
+                                if any(x[0] in ('reg','stack') for x in parts) and current not in following:
+                                    following.append(current)
+                                if len(following)>=MAX_PATHS:
+                                    break
                         except (TraceError,RecursionError) as error:
                             log(f'[!] Candidate stopped: {error}')
-                            continue
-                        best=current
-                        if self.inspect_candidate(current,expected):
-                            self.report(current,expected,True,'Static CFG path candidate, not execution history')
-                            return
-                        # Registers surviving into the callee entry can be traced at its caller.
-                        # Stack addresses are absolute within this stopped snapshot.
-                        current=rewrite(current,{r:U(f'{r} at function entry') for r in VOLATILE-ARGUMENTS},[])
-                        if any(x[0]=='unknown' for x in leaves(current)):
-                            continue
-                        if any(x[0] in ('reg','stack') for x in leaves(current)) and current not in following:
-                            following.append(current)
                         if len(following)>=MAX_PATHS:
                             break
                     if len(following)>=MAX_PATHS:
@@ -846,9 +1271,12 @@ class ProvenanceAnalyzer(Decoder):
             candidates=following
             log(f'[+] Function entry reached; moving to caller with {len(candidates)} candidate(s)')
         self.report(best,expected,False,'Bounded static CFG analysis')
+        return False
 
-    def trace_recorded(self, history, regs, target, watch=None):
-        expr,expected=self.target_expr(target,regs,watch)
+    def trace_recorded(self, history, regs, target, watch=None, watch_size=1, watch_offset=0):
+        expr,expected=self.target_expr(target,regs,watch,watch_size,watch_offset)
+        self.trace_messages=set()
+        self.scan_partials=[]
         log(f'[record] reversing {len(history):,} executed instructions')
         for index in range(len(history)-1,-1,-1):
             self.budget.check('recorded backward trace')
@@ -858,14 +1286,21 @@ class ProvenanceAnalyzer(Decoder):
             if abs(before['rbp']-before['rsp'])<0x800000:
                 stack['rbp']=stackaddr(before['rbp'])
             expr=self.transfer(ins,expr,stack,before,True,after)
+        self.remember_partial(expr)
         matched=self.inspect_candidate(expr,expected)
         self.report(expr,expected,matched,'Recorded single-thread path from selected start; other-thread writes not recorded')
+        return matched
 
 
-def watch_delta(start, width, watch):
+def watch_delta(start, width, watch, watch_size=1, watch_offset=0):
     if not (0 <= start <= MASK and width > 0 and start+width <= MASK+1):
         raise TraceError('Invalid memory access range')
-    return watch-start if start <= watch < start+width else None
+    first = watch + watch_offset
+    if not (0 <= watch <= MASK and watch_offset >= 0 and watch_size > 0 and first+watch_size <= MASK+1):
+        raise TraceError('Invalid watch range')
+    if start < first+watch_size and first < start+width:
+        return watch-start
+    return None
 
 
 def condition(code, flags):
@@ -875,6 +1310,261 @@ def condition(code, flags):
             'a':not(c or z),'nbe':not(c or z),'s':s,'ns':not s,'p':p,'pe':p,'np':not p,'po':not p,
             'l':s!=o,'nge':s!=o,'ge':s==o,'nl':s==o,'le':z or s!=o,'ng':z or s!=o,
             'g':not z and s==o,'nle':not z and s==o}.get(code)
+
+
+@dataclass(frozen=True)
+class ScanOptions:
+    depth: int
+    offset: int
+    alignment: int
+
+
+@dataclass(frozen=True)
+class ScanRegion:
+    start: int
+    end: int
+    writable: bool = False
+    executable: bool = False
+
+
+@dataclass(frozen=True)
+class ScanTail:
+    leading: int = 0
+    offsets: tuple = ()
+    from_stack: bool = False
+
+    def prepend(self, offset):
+        return ScanTail(0, (offset+self.leading,)+self.offsets, self.from_stack)
+
+
+MAX_SCAN_FRONTIER = 4096
+SCAN_BLOCK = 512 * 1024
+
+
+def split_scan_ranges(regions, modules, preferred, expected):
+    writable, deferred, others = [], [], []
+    images = sorted(modules,key=lambda module: module.base)
+    for region in regions:
+        low,high=region.start,region.end
+        for module in images:
+            start,end=module.base,module.base+module.size
+            if end <= low:
+                continue
+            if start >= high:
+                break
+            if low < start:
+                others.append((not region.writable,low,start))
+            rank=(region.executable,module!=preferred)
+            (writable if region.writable and not region.executable else deferred).append(
+                (rank,max(low,start),min(high,end)))
+            low = end
+            if low >= high:
+                break
+        if low < high:
+            others.append((not region.writable,low,high))
+    others.sort(key=lambda entry: (entry[0],max(0,entry[1]-expected,expected-entry[2])))
+    return ([(start,end) for _,start,end in sorted(writable)],
+            [(start,end) for _,start,end in sorted(deferred)],
+            [(start,end) for _,start,end in others])
+
+
+def freeze_stack_loads(expr, pm, cache):
+    kind=expr[0]
+    if kind=='load':
+        width,address,_=expr[1:]
+        if address[0]=='stack':
+            key=(width,address[1])
+            if key not in cache:
+                try:
+                    cache[key]=K(evaluate(expr,pm))
+                except Exception:
+                    cache[key]=U(f'unreadable stack slot 0x{address[1]:X}')
+            return cache[key]
+        return L(width,freeze_stack_loads(address,pm,cache))
+    if kind in ('reg','stack','const','unknown'):
+        return expr
+    return B(kind,freeze_stack_loads(expr[1],pm,cache),freeze_stack_loads(expr[2],pm,cache))
+
+
+def snapshot_scan_seeds(analyzer, expected, budget):
+    frontier={expected:ScanTail()}
+    cache={}
+    for expr in reversed(getattr(analyzer,'scan_partials',())):
+        budget.check('stack-derived scan offsets')
+        try:
+            fixed=freeze_stack_loads(expr,analyzer.pm,cache)
+        except Exception:
+            continue
+        try:
+            matches=evaluate(fixed,analyzer.pm)==expected
+        except Exception:
+            matches=False
+        node,leading,offsets=fixed,0,()
+        while node[0]=='load' or (node[0]=='add' and node[2][0]=='const'):
+            if node[0]=='add':
+                leading+=signed(node[2][1])
+                node=node[1]
+            if node[0]=='load' and node[1]==8:
+                # A traced field displacement gives the base even if an
+                # earlier owner pointer is still symbolic.
+                if matches or not offsets:
+                    address=evaluate(node,analyzer.pm) if matches else (expected-leading)&MASK
+                    if address:
+                        frontier.setdefault(address,ScanTail(leading,offsets,True))
+                if not matches:
+                    break
+                offsets=(leading,)+offsets
+                leading=0
+                node=node[2]
+            elif node[0]!='add':
+                break
+        if matches and node[0]=='const' and node[1] and offsets:
+            frontier.setdefault(node[1],ScanTail(leading,offsets,True))
+            if containing(analyzer.modules,node[1]) and analyzer.inspect_candidate(fixed,expected):
+                analyzer.report(fixed,expected,True,'Module-root candidate with stack-derived offsets fixed at the breakpoint')
+                return None
+    if len(frontier)>1:
+        log(f'[scan] Added {len(frontier)-1} target address(es) using traced stack-derived offsets')
+    return frontier
+
+
+def scan_blocks(pm, ranges, budget, cross_boundary=False):
+    for start, end in ranges:
+        for address in range(start, end, SCAN_BLOCK):
+            budget.check('pointer scan memory reads')
+            size = min(SCAN_BLOCK, end - address)
+            inside=min(size+7,end-address)
+            extended=min(size+7,MASK+1-address) if cross_boundary else inside
+            for amount in dict.fromkeys((extended,inside)):
+                try:
+                    data=read_exact(pm,address,amount)
+                except Exception:
+                    continue
+                yield address,size,data
+                break
+            else:
+                # A partial read should not drop the other readable pages in this block.
+                for page in range(address, address + size, 4096):
+                    budget.check('pointer scan page reads')
+                    page_size = min(4096, address + size - page)
+                    limit=MASK+1 if cross_boundary else end
+                    for read_size in dict.fromkeys((min(page_size+7,limit-page),
+                                                    min(page_size+7,end-page),page_size)):
+                        try:
+                            data = read_exact(pm, page, read_size)
+                        except Exception:
+                            continue
+                        yield page, page_size, data
+                        break
+
+
+def scan_links(pm, ranges, frontier, visited, options, budget, phase=None):
+    targets = sorted(frontier)
+    offset = options.offset
+    # Search upper pointer bytes in C, then check the full 64-bit value and signed offset.
+    # Coarser prefixes keep the number of full-buffer searches bounded for a wide frontier.
+    prefix_bytes = 2
+    prefixes = set()
+    for shift in (16, 32, 40, 48, 56):
+        prefixes = set()
+        for target in targets:
+            low = max(0, target - offset) >> shift
+            high = min(MASK, target + offset) >> shift
+            if shift < 56 and high - low >= 8:
+                break
+            prefixes.update(range(low, high + 1))
+            if shift < 56 and len(prefixes) > 8:
+                break
+        else:
+            prefix_bytes = shift // 8
+            break
+    needles = [prefix.to_bytes(8 - prefix_bytes, 'little') for prefix in sorted(prefixes)]
+    scanned=0
+    last=time.monotonic()
+    for base, size, data in scan_blocks(pm, ranges, budget, options.alignment==1):
+        scanned+=size
+        if phase and time.monotonic()-last>=2:
+            log(f'[scan] {phase}: {scanned / (1024*1024):.1f} MiB read')
+            last=time.monotonic()
+        for needle in needles:
+            hit = data.find(needle, prefix_bytes)
+            attempts = 0
+            while hit != -1:
+                index = hit - prefix_bytes
+                if index >= size:
+                    break
+                slot = base + index
+                if slot % options.alignment == 0 and slot not in visited:
+                    value = struct.unpack_from('<Q', data, index)[0]
+                    next_index = bisect_left(targets, value)
+                    choices = targets[max(0, next_index - 1):next_index + 1]
+                    target = min(choices, key=lambda address: abs(address - value))
+                    if abs(target - value) <= offset:
+                        yield slot, frontier[target].prepend(target-value)
+                attempts += 1
+                if attempts % 4096 == 0:
+                    budget.check('pointer scan candidates')
+                hit = data.find(needle, hit + 1)
+
+
+def reverse_pointer_scan(analyzer, regions, expected, options, budget, preferred=None):
+    frontier=snapshot_scan_seeds(analyzer,expected,budget)
+    if frontier is None:
+        return True
+    roots, remaining_roots, other_ranges=split_scan_ranges(regions,analyzer.modules,preferred,expected)
+    if not roots and not remaining_roots:
+        log('[scan] No readable module ranges')
+        return False
+    log(f'[scan] Searching readable memory; depth={options.depth}, '
+        f'max signed offset=0x{options.offset:X}, alignment={options.alignment}')
+    visited=set(frontier)
+    deferred_targets={}
+
+    def check_roots(ranges,targets,phase,stage_budget):
+        for root,tail in scan_links(analyzer.pm,ranges,targets,set(targets),options,stage_budget,phase):
+            expr=K(root)
+            for offset in tail.offsets:
+                expr=B('add',L(8,expr),K(offset))
+            if analyzer.inspect_candidate(expr,expected):
+                mode=('Reverse scan with stack-derived offsets fixed at the breakpoint'
+                      if tail.from_stack else 'Reverse memory scan candidate')
+                analyzer.report(expr,expected,True,mode)
+                return True
+        return False
+
+    primary_budget=Budget(max(0,budget.end-time.monotonic())*0.85) if roots and remaining_roots else budget
+    try:
+        for depth in range(1, options.depth + 1):
+            primary_budget.check('pointer scan depth')
+            log(f'[scan] Depth {depth}: {len(frontier):,} target slot(s)')
+            deferred_targets.update(frontier)
+            if roots and check_roots(roots,frontier,'writable module data',primary_budget):
+                return True
+            if depth==1 and not roots and remaining_roots:
+                if check_roots(remaining_roots,frontier,'readable module regions',primary_budget):
+                    return True
+                deferred_targets.clear()
+            if depth == options.depth:
+                break
+            following = {}
+            for slot,tail in scan_links(analyzer.pm,other_ranges,frontier,visited,options,primary_budget,'non-module regions'):
+                following.setdefault(slot,tail)
+                if len(following) >= MAX_SCAN_FRONTIER:
+                    log(f'[?] Scan frontier capped at {MAX_SCAN_FRONTIER:,} slots')
+                    break
+            if not following:
+                break
+            visited.update(following)
+            frontier = following
+    except TraceError:
+        if primary_budget is budget or time.monotonic()<primary_budget.end:
+            raise
+        log('[scan] Moving to the remaining module regions')
+    if remaining_roots and deferred_targets:
+        if check_roots(remaining_roots,deferred_targets,'remaining module regions',budget):
+            return True
+    log('[!] Pointer scan found no matching module-relative chain within its limits')
+    return False
 
 
 # Windows API structures; explicit fixed widths keep layout auditable.
@@ -922,6 +1612,12 @@ class DebugEvent(C.Structure):
     _fields_ = [('code', DWORD), ('pid', DWORD), ('tid', DWORD), ('info', EventUnion)]
 
 
+class MemoryBasicInformation(C.Structure):
+    _fields_ = [('base', PTR), ('allocation_base', PTR), ('allocation_protect', DWORD),
+                ('partition', C.c_uint16), ('size', C.c_size_t), ('state', DWORD),
+                ('protect', DWORD), ('kind', DWORD)]
+
+
 def check(result, operation):
     if not result:
         error = C.get_last_error()
@@ -955,6 +1651,7 @@ class WinAPI:
             ('OpenThread', HANDLE, (DWORD, BOOL, DWORD)), ('CloseHandle', BOOL, (HANDLE,)),
             ('SuspendThread', DWORD, (HANDLE,)), ('ResumeThread', DWORD, (HANDLE,)),
             ('GetThreadContext', BOOL, (HANDLE, PTR)), ('SetThreadContext', BOOL, (HANDLE, PTR)),
+            ('VirtualQueryEx', C.c_size_t, (HANDLE, PTR, C.POINTER(MemoryBasicInformation), C.c_size_t)),
             ('FlushInstructionCache', BOOL, (HANDLE, PTR, C.c_size_t)),
             ('DebugBreakProcess', BOOL, (HANDLE,)), ('IsWow64Process2', BOOL, (HANDLE, C.POINTER(C.c_uint16), C.POINTER(C.c_uint16)))
         ]:
@@ -972,6 +1669,33 @@ class WinAPI:
         C.c_uint32.from_address(address + 48).value = 0x10000B
         check(self.GetThreadContext(thread, address), 'GetThreadContext')
         return raw, address
+
+    def readable_regions(self, process, budget):
+        regions = []
+        info = MemoryBasicInformation()
+        address = 0
+        while address <= MASK:
+            budget.check('VirtualQueryEx')
+            size = self.VirtualQueryEx(process, address, C.byref(info), C.sizeof(info))
+            if not size and C.get_last_error() == 87 and address and regions:
+                break
+            check(size, 'VirtualQueryEx')
+            start = int(info.base or 0)
+            end = start + info.size
+            if end <= address:
+                raise TraceError('VirtualQueryEx returned a non-advancing memory range')
+            readable = (info.protect & 0xff) in (0x02, 0x04, 0x08, 0x20, 0x40, 0x80)
+            if info.state == 0x1000 and readable and not info.protect & 0x100:
+                protection=info.protect & 0xff
+                writable=protection in (0x04,0x08,0x40,0x80)
+                executable=protection in (0x20,0x40,0x80)
+                if regions and regions[-1].end==start and (
+                    regions[-1].writable,regions[-1].executable)==(writable,executable):
+                    regions[-1]=ScanRegion(regions[-1].start,end,writable,executable)
+                else:
+                    regions.append(ScanRegion(start,end,writable,executable))
+            address = end
+        return regions
 
     def stack(self, pm, thread, context, budget):
         raw, copy = context_buffer()
@@ -1045,38 +1769,69 @@ class WinAPI:
         return pid
 
 
-def analyze_hit(api, pm, thread, context, target, manual, seconds, watch=None):
-    budget = Budget(seconds)
-    # Prints the actual Python stack if an individual native call stalls.
-    faulthandler.dump_traceback_later(5, repeat=True)
+def resolve_hit(api, analyzer, regs, target, watch, trace, seconds, scan, value_type):
+    expected = watch
     try:
-        regs = registers(context)
-        log('\n========== REGISTERS ==========')
-        for name, value in regs.items():
-            log(f'{name.upper():3} = 0x{value:016X}')
-        modules = get_modules(pm)
-        log('\n========== STACK MEMORY ==========')
-        for i in range(16):
-            budget.check('stack memory')
-            try:
-                value = u64(pm, regs['rsp'] + 8 * i)
-            except Exception:
-                continue
-            log(f'RSP+0x{i * 8:02X} | 0x{value:016X} | {label(modules, value)}')
+        needs_access = value_type is not None and (expected is None or value_type.size is None)
+        if needs_access or (expected is None and scan is not None):
+            _, _, start, width = analyzer.access_info(target, regs)
+            if expected is None:
+                expected = start
+        if value_type is not None:
+            size = value_type.size if value_type.size is not None else start + width - expected
+            value = read_value(analyzer.pm, expected, value_type, size)
+            log(f'[value] {value_type.name} at 0x{expected:X} before instruction: {value}')
+    except Exception as error:
+        if value_type is not None:
+            log(f'[!] Could not read {value_type.name}: {error}')
+        elif scan:
+            log(f'[!] Could not determine scan target: {error}')
+    try:
+        if trace():
+            return True
+    except Exception as error:
+        log(f'[!] Provenance trace stopped: {type(error).__name__}: {error}')
+    if scan and expected is not None:
+        budget = Budget(seconds)
         try:
-            frames = api.stack(pm, thread, context, budget)
+            regions = api.readable_regions(analyzer.pm.process_handle, budget)
+            return reverse_pointer_scan(analyzer, regions, expected, scan, budget,
+                                        containing(analyzer.modules,target))
         except Exception as error:
-            log(f'[!] StackWalk64: {error}')
-            frames = [{'rip': target, 'rsp': regs['rsp'], 'rbp': regs['rbp']}]
-        log('\n========== CALL STACK ==========')
-        for i, frame in enumerate(frames):
-            log(f'#{i:02d} {label(modules, frame["rip"])} RSP=0x{frame["rsp"]:X}')
-        ProvenanceAnalyzer(pm, modules, budget).trace(frames, regs, target, manual, watch)
-    finally:
-        faulthandler.cancel_dump_traceback_later()
+            log(f'[!] Pointer scan stopped: {type(error).__name__}: {error}')
+    return False
 
 
-def wait_breakpoint(api, pm, target, manual, seconds, watch=None):
+def analyze_hit(api, pm, thread, context, target, manual, seconds, watch=None, scan=None, value_type=None):
+    budget = Budget(seconds)
+    regs = registers(context)
+    log('\n========== REGISTERS ==========')
+    for name, value in regs.items():
+        log(f'{name.upper():3} = 0x{value:016X}')
+    modules = get_modules(pm)
+    log('\n========== STACK MEMORY ==========')
+    for i in range(16):
+        budget.check('stack memory')
+        try:
+            value = u64(pm, regs['rsp'] + 8 * i)
+        except Exception:
+            continue
+        log(f'RSP+0x{i * 8:02X} | 0x{value:016X} | {label(modules, value)}')
+    try:
+        frames = api.stack(pm, thread, context, budget)
+    except Exception as error:
+        log(f'[!] StackWalk64: {error}')
+        frames = [{'rip': target, 'rsp': regs['rsp'], 'rbp': regs['rbp']}]
+    log('\n========== CALL STACK ==========')
+    for i, frame in enumerate(frames):
+        log(f'#{i:02d} {label(modules, frame["rip"])} RSP=0x{frame["rsp"]:X}')
+    analyzer = ProvenanceAnalyzer(pm, modules, budget)
+    watch_range = value_type.watch_range if value_type is not None else (1, 0)
+    resolve_hit(api, analyzer, regs, target, watch,
+                lambda: analyzer.trace(frames, regs, target, manual, watch, *watch_range), seconds, scan, value_type)
+
+
+def wait_breakpoint(api, pm, target, manual, seconds, watch=None, scan=None, value_type=None):
     original = read_exact(pm, target, 1)
     if original == b'\xcc':
         raise TraceError('Target already contains INT3')
@@ -1089,6 +1844,7 @@ def wait_breakpoint(api, pm, target, manual, seconds, watch=None):
     misses = 0
     step_code = 0x80000004
     decoder = None
+    watch_range = value_type.watch_range if value_type is not None else (1, 0)
 
     def open_thread(tid, rights=0x0008 | 0x0010 | 0x0040):
         return check(api.OpenThread(rights, False, tid), 'OpenThread')
@@ -1200,12 +1956,12 @@ def wait_breakpoint(api, pm, target, manual, seconds, watch=None):
                                         decoder=ProvenanceAnalyzer(pm,[],Budget(seconds))
                                     decoder.budget=Budget(seconds)
                                     _,_,start,width=decoder.access_info(target,regs)
-                                    delta=watch_delta(start,width,watch)
+                                    delta=watch_delta(start,width,watch,*watch_range)
                                 if delta is not None:
                                     finished=True
                                     log(f'[+] Breakpoint hit, TID={event.tid}; skipped {misses} nonmatching hits')
                                     try:
-                                        analyze_hit(api,pm,thread,context,target,manual,seconds,watch)
+                                        analyze_hit(api,pm,thread,context,target,manual,seconds,watch,scan,value_type)
                                     except (Exception,KeyboardInterrupt) as error:
                                         log(f'[!] Analysis stopped: {type(error).__name__}: {error}')
                                 else:
@@ -1285,19 +2041,21 @@ def wait_breakpoint(api, pm, target, manual, seconds, watch=None):
                     log(f'[!] Debugger detach failed: {C.get_last_error()}')
 
 
-def wait_recorded(api, pm, start, target, manual, seconds, max_steps, record_seconds, watch=None):
+def wait_recorded(api, pm, start, target, manual, seconds, max_steps, record_seconds,
+                  watch=None, scan=None, value_type=None):
     """Opt-in single-thread recording, starting BEFORE the desired instruction.
     Every history entry is the instruction and register state before execution.
     The ordinary debugger is used when --record-from is not supplied.
     """
     if start == target:
-        return wait_breakpoint(api, pm, target, manual, seconds, watch)
+        return wait_breakpoint(api, pm, target, manual, seconds, watch, scan, value_type)
     original=read_exact(pm,start,1)
     if original==b'\xcc':
         raise TraceError('Recording start already contains INT3')
     pid=api.attach(pm)
     patched=initialized=exited=cancel=False
     tracked=None; history=[]; analyzer=None; deadline=None; tf_original=False
+    watch_range = value_type.watch_range if value_type is not None else (1, 0)
     step_code=0x80000004
     def flags(context):
         return C.c_uint32.from_address(context+68)
@@ -1393,7 +2151,7 @@ def wait_recorded(api, pm, start, target, manual, seconds, max_steps, record_sec
                             hit=pc==target
                             if hit and watch is not None:
                                 _,_,access_start,width=analyzer.access_info(target,before)
-                                hit=watch_delta(access_start,width,watch) is not None
+                                hit=watch_delta(access_start,width,watch,*watch_range) is not None
                                 if not hit:
                                     log(f'[filter] recorded hit outside watch: 0x{access_start:X}..0x{access_start+width-1:X}')
                             if hit or cancel or len(history)>=max_steps or time.monotonic()>=deadline:
@@ -1402,11 +2160,9 @@ def wait_recorded(api, pm, start, target, manual, seconds, max_steps, record_sec
                                 tracked=None; finished=True
                                 if hit and not cancel:
                                     analyzer.budget=Budget(seconds)
-                                    faulthandler.dump_traceback_later(5,repeat=True)
-                                    try:
-                                        analyzer.trace_recorded(history,before,target,watch)
-                                    finally:
-                                        faulthandler.cancel_dump_traceback_later()
+                                    resolve_hit(api, analyzer, before, target, watch,
+                                                lambda: analyzer.trace_recorded(history,before,target,watch,*watch_range),
+                                                seconds, scan, value_type)
                                 else:
                                     log(f'[record] stopped before target after {len(history)} instructions')
                             else:
@@ -1450,6 +2206,72 @@ def wait_recorded(api, pm, start, target, manual, seconds, max_steps, record_sec
 
 
 def self_test():
+    values = [
+        ('byte', b'\xff', '255'),
+        ('i8', b'\x80', '-128'),
+        ('u16', b'\x34\x12', '4660'),
+        ('int24', b'\x00\x00\x80', '-8388608'),
+        ('4 Bytes', b'\xff' * 4, '4294967295'),
+        ('uint48', b'\xff' * 6, str((1 << 48) - 1)),
+        ('i64', b'\xff' * 8, '-1'),
+        ('u128', b'\xff' * 16, str((1 << 128) - 1)),
+        ('u256', b'\x00' * 31 + b'\x80', str(1 << 255)),
+        ('bool', b'\x00', 'false'),
+        ('bool32', b'\x00\x00\x80\x00', 'true'),
+        ('ptr32', b'\x78\x56\x34\x12', '0x12345678'),
+        ('ptr', b'\x00\x00\x00\x40\x01\x00\x00\x00', '0x0000000140000000'),
+        ('f16', struct.pack('<e', 1.5), '1.5'),
+        ('bfloat16', b'\xc0\x3f', '1.5'),
+        ('f32', struct.pack('<f', -0.0), '-0.0'),
+        ('f64', struct.pack('<d', float('inf')), 'inf'),
+        ('f32', bytes.fromhex('00 00 C0 FF'), '-nan'),
+        ('f80', bytes.fromhex('00 00 00 00 00 00 00 80 FF 7F'), 'inf'),
+        ('f128', bytes.fromhex('00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 80'), '-0.0'),
+        ('ascii[2]', b'A\xff', repr('A\\xff')),
+        ('text:cp949[4]', '한글'.encode('cp949'), repr('한글')),
+        ('utf8[6]', '한글'.encode('utf-8'), repr('한글')),
+        ('utf16[2]', '😀'.encode('utf-16-le'), repr('😀')),
+        ('utf32[1]', '😀'.encode('utf-32-le'), repr('😀')),
+        ('cutf16[4]', '가\0나'.encode('utf-16-le') + b'\0\0', repr('가')),
+        ('wchar', '가'.encode('utf-16-le'), repr('가')),
+        ('bytes[3]', b'\x00\xde\xad', '00 DE AD'),
+        ('bits[7:4]', b'\x80\x05', '11'),
+        ('sbits[7:4]', b'\x80\x05', '-5'),
+        ('f32[3]', struct.pack('<3f', 1.5, 2.5, -3.5), '[1.5, 2.5, -3.5]'),
+        ('u16[2][2]', struct.pack('<4H', 1, 2, 3, 4), '[[1, 2], [3, 4]]'),
+        ('struct:<ifB3x', struct.pack('<ifB3x', -20, 2.5, 1), '(-20, 2.5, 1)'),
+        ('struct:<h[2]', struct.pack('<2h', -2, 1), '[(-2,), (1,)]'),
+    ]
+    for name, data, expected in values:
+        spec = parse_value_type(name)
+        assert spec.size == len(data), (name, spec.size, len(data))
+        assert spec.decode(data) == expected, (name, spec.decode(data), expected)
+    extended = bytes.fromhex('00 00 00 00 00 00 00 A0 FF 3F')
+    assert Decimal(parse_value_type('f80').decode(extended)) == Decimal('1.25')
+    quad = ((16383 << 112) | 1).to_bytes(16, 'big')
+    assert Decimal(parse_value_type('f128', 'big').decode(quad)) > 1
+    assert Decimal(parse_value_type('f128').decode((1).to_bytes(16, 'little'))) > 0
+    assert parse_value_type('i24', 'big').decode(b'\x80\x00\x00') == '-8388608'
+    assert parse_value_type('bf16', 'big').decode(b'\x3f\xc0') == '1.5'
+    assert parse_value_type('utf16[2]', 'big').decode('한글'.encode('utf-16-be')) == repr('한글')
+    assert parse_value_type('struct:HI', 'big').decode(struct.pack('>HI', 1, 2)) == '(1, 2)'
+    field = parse_value_type('bits[16:1]')
+    assert field.watch_range == (1, 2)
+    assert watch_delta(0x4000, 1, 0x4000, *field.watch_range) is None
+    assert watch_delta(0x4002, 1, 0x4000, *field.watch_range) == -2
+    assert parse_value_type('bits[16:1]', 'big').watch_range == (1, 0)
+    assert parse_value_type('none') is None
+    assert parse_value_type('auto').decode(b'\x01\xab') == '01 AB'
+    assert 'float32=1.5' in parse_value_type('all').decode(struct.pack('<f', 1.5))
+    for bad in ('i7', 'u0', 'bytes[0]', 'u8[0]', 'auto[8]', 'bits[4:0]', 'struct:', 'text:bogus[8]'):
+        try:
+            parse_value_type(bad)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f'Accepted invalid value type: {bad}')
+    log('[PASS] scalar, endian, extended float, bytes, text, bit fields, arrays, and struct formats')
+
     # A virtual PE with one million entries; only requested bytes are generated.
     base, pdata, count = 0x140000000, 0x1000, 1_000_000
     class FakeMemory:
@@ -1503,6 +2325,7 @@ def self_test():
     assert C.sizeof(DebugEvent) == 176 and DebugEvent.info.offset == 16
     assert ExceptionRecord.address.offset == 16 and C.sizeof(Address64) == 16
     assert StackFrame64.KdHelp.offset == 152 and C.sizeof(KDHelp64) == 112
+    assert C.sizeof(MemoryBasicInformation) == 48 and MemoryBasicInformation.size.offset == 24
     log('[PASS] regex, chain composition, pointer resolution, and x64 structure offsets')
 
     # Test the NEW engine, not the old linear prototype. Fake decoded instructions
@@ -1596,13 +2419,24 @@ def self_test():
     assert 'Expected: 0x4128' in captured,captured
     assert '[+] Address matched' in captured,captured
     assert 'Access size: 16 bytes' in captured,captured
+    assert watch_delta(0x4120,16,0x411e,4)==-2
+    assert watch_delta(0x4120,16,0x411c,4) is None
+    assert watch_delta(0x4123,1,0x4120,4)==-3
+    assert watch_delta(0x4124,1,0x4120,4) is None
+    output=StringIO()
+    with redirect_stdout(output):
+        assert MockAnalyzer().trace(frames,{'rcx':0x4000},target,None,0x411e,4)
+    captured=output.getvalue()
+    assert 'Chain: [[example.exe+0x800]+0x30]+0x11E' in captured,captured
+    assert 'Access offset: -0x2' in captured,captured
+    assert 'Expected: 0x411E' in captured,captured
     try:
         MockAnalyzer().target_expr(target,{'rcx':0x4000},0x4130)
     except TraceError:
         pass
     else:
         raise AssertionError('Out-of-range watch accepted')
-    log('[PASS] SIMD store interior watch: exact +8 chain, half-open boundary checks')
+    log('[PASS] SIMD, partial typed ranges, byte writes inside wider values, and exact start addresses')
 
 
     a=MockAnalyzer()
@@ -1646,6 +2480,166 @@ def self_test():
         a.trace([{'rip':target,'rsp':0x8008}],{'rcx':0x5000},target,None)
     assert 'Chain: [example.exe+0x808]+0x120' in output.getvalue(),output.getvalue()
     log('[PASS] conditional CFG predecessor paths and snapshot validation')
+
+    # A completed call supplies RAX to a SIMD store. The first RET path has
+    # another result; only the second agrees with the watched byte at +4.
+    target=f1+9
+    pm.ptrs={root:0x2000,0x2030:0x4000}
+    owner=FakeInsn(f1,'mov','rcx, [rip + owner]',(reg('rcx'),mem('rip',root-(f1+4))),('rcx',))
+    direct=FakeInsn(f1+4,'call','getter',(imm(f0),),('rsp',),5)
+    store=FakeInsn(target,'movups','[rax], xmm0',(mem('rax',0,size=16,access=2),reg('xmm0',16)))
+    getter=[FakeInsn(f0,'jne','other',(imm(f0+12),),jump=True),
+            FakeInsn(f0+4,'lea','rax, [rcx + 0x40]',(reg('rax'),mem('rcx',0x40)),('rax',)),
+            FakeInsn(f0+8,'ret','',(),('rsp',),1,ret=True),
+            FakeInsn(f0+12,'mov','rax, [rcx + 0x30]',(reg('rax'),mem('rcx',0x30)),('rax',)),
+            FakeInsn(f0+16,'ret','',(),('rsp',),1,ret=True)]
+    insns={ins.address:ins for ins in [owner,direct,store]+getter}
+    frames=[{'rip':target,'rsp':0x8010}]
+    output=StringIO()
+    with redirect_stdout(output):
+        assert MockAnalyzer().trace(frames,{'rax':0x4000},target,None,0x4004)
+    captured=output.getvalue()
+    assert 'Chain: [[example.exe+0x800]+0x30]+0x4' in captured,captured
+    assert '-> 0x2044' in captured and 'Expected: 0x4004' in captured,captured
+    log('[PASS] static direct CALL through two RET paths to exact SIMD watch at +4')
+
+    # IAT-like CALL into a tail thunk; the final leaf has no unwind entry.
+    thunk_ptr,leaf_ptr=root+8,root+16
+    pm.ptrs.update({thunk_ptr:f0,leaf_ptr:f2})
+    indirect=FakeInsn(f1+4,'call','qword ptr [rip + target]',
+                      (mem('rip',thunk_ptr-(f1+9)),),('rsp',),5)
+    thunk=FakeInsn(f0,'jmp','qword ptr [rip + leaf]',
+                   (mem('rip',leaf_ptr-(f0+4)),),jump=True)
+    leaf=[FakeInsn(f2,'mov','rax, [rcx + 0x30]',(reg('rax'),mem('rcx',0x30)),('rax',)),
+          FakeInsn(f2+4,'ret','',(),('rsp',),1,ret=True)]
+    insns={ins.address:ins for ins in [owner,indirect,store,thunk]+leaf}
+    output=StringIO()
+    with redirect_stdout(output):
+        a=MockAnalyzer()
+        find=a.table.find
+        a.table.find=lambda address: None if address==f2 else find(address)
+        assert a.trace(frames,{'rax':0x4000},target,None,0x4004)
+    assert 'Chain: [[example.exe+0x800]+0x30]+0x4' in output.getvalue(),output.getvalue()
+    log('[PASS] indirect CALL and tail JMP into a leaf without .pdata')
+
+    # The callee writes a caller-owned stack slot passed by address.
+    pm.ptrs[root]=0x4000
+    target=f1+17
+    out_path=[FakeInsn(f1,'mov','rdx, [rip + root]',(reg('rdx'),mem('rip',root-(f1+4))),('rdx',)),
+              FakeInsn(f1+4,'lea','rcx, [rsp + 0x28]',(reg('rcx'),mem('rsp',0x28)),('rcx',)),
+              FakeInsn(f1+8,'call','writer',(imm(f0),),('rsp',),5),
+              FakeInsn(f1+13,'mov','rax, [rsp + 0x28]',(reg('rax'),mem('rsp',0x28)),('rax',)),
+              FakeInsn(target,'movups','[rax], xmm0',(mem('rax',0,size=16,access=2),reg('xmm0',16))),
+              FakeInsn(f0,'mov','[rcx], rdx',(mem('rcx',0,access=2),reg('rdx'))),
+              FakeInsn(f0+4,'ret','',(),('rsp',),1,ret=True)]
+    insns={ins.address:ins for ins in out_path}
+    output=StringIO()
+    with redirect_stdout(output):
+        a=MockAnalyzer()
+        assert a.trace([{'rip':target,'rsp':0x8010}],{'rax':0x4000},target,None,0x4004)
+    assert 'Chain: [example.exe+0x800]+0x4' in output.getvalue(),output.getvalue()
+    log('[PASS] static CALL through a by-reference stack output')
+
+    # The caller constructs a stack object and passes its address in a
+    # register. Rewinding the LEA must let the earlier member store alias.
+    stack_path=[FakeInsn(f0,'mov','[rsp + 0x68], rcx',(mem('rsp',0x68,access=2),reg('rcx'))),
+                FakeInsn(f0+4,'lea','r14, [rsp + 0x50]',(reg('r14'),mem('rsp',0x50)),('r14',))]
+    a=MockAnalyzer()
+    stack_states,_=a.stack_coordinates(stack_path,0x8008)
+    with redirect_stdout(StringIO()):
+        result=list(a.rewind(stack_path,stack_states,L(8,B('add',R('r14'),K(0x18)))))
+    assert result==[R('rcx')],result
+    log('[PASS] stack object LEA normalizes before matching the earlier member store')
+
+    # Conditional dataflow must preserve both possible definitions.
+    conditional=FakeInsn(f0+4,'cmovne','rax, rcx',(reg('rax'),reg('rcx')),('rax',))
+    with redirect_stdout(StringIO()):
+        assert set(MockAnalyzer().rewind([conditional],[{}],R('rax')))=={R('rax'),R('rcx')}
+    log('[PASS] both static CMOV paths retained')
+
+    class ScanMemory:
+        process_handle=1
+
+        def __init__(self, blocks):
+            self.blocks=blocks
+
+        def read_bytes(self, address, size):
+            for start,data in self.blocks:
+                if start<=address and address+size<=start+len(data):
+                    return bytes(data[address-start:address-start+size])
+            raise ValueError(f'unmapped 0x{address:X}')
+
+    image, heap, watched=bytearray(64),bytearray(64),bytearray(64)
+    struct.pack_into('<Q',image,8,0x7070)
+    struct.pack_into('<Q',heap,0x20,0x4000)
+    struct.pack_into('<f',watched,4,123.5)
+    a=MockAnalyzer()
+    a.pm=ScanMemory([(root,image),(0x7040,heap),(0x4000,watched)])
+    a.modules=[Module('example.exe',base,0x1000)]
+    api=NS(readable_regions=lambda process,budget: [ScanRegion(0x4000,0x4040,True),
+           ScanRegion(0x7040,0x7080,True),ScanRegion(root,root+64,True)])
+
+    def unresolved_trace():
+        raise TraceError('unresolved instruction')
+
+    output=StringIO()
+    with redirect_stdout(output):
+        assert resolve_hit(api,a,{},target,0x4004,unresolved_trace,10,ScanOptions(2,0x10,8),parse_value_type('f32'))
+    captured=output.getvalue()
+    assert 'Chain: [[example.exe+0x808]-0x10]+0x4' in captured,captured
+    assert 'before instruction: 123.5' in captured,captured
+    log('[PASS] failed symbolic trace falls back to signed two-hop scan and reads float32')
+
+    output=StringIO()
+    with redirect_stdout(output):
+        assert resolve_hit(api,a,{'rax':0x4000},target,0x4004,lambda:True,10,None,parse_value_type('auto'))
+    assert 'auto at 0x4004 before instruction: 00 00 F7 42' in output.getvalue(),output.getvalue()
+    utf16 = parse_value_type('cutf16[16]')
+    text_memory=ScanMemory([(0x9000,'가\0'.encode('utf-16-le'))])
+    assert read_value(text_memory,0x9000,utf16,utf16.size)==repr('가')
+    log('[PASS] automatic access-sized raw read and short NUL-terminated string before unreadable memory')
+
+    # The watch is in a selected slab 0x46AC bytes past its page base.
+    # The physical module pointer only reaches the table owner.
+    owner_address,table_address,slab=0x260000,0x300000,0x500000
+    owner_bytes,table_bytes,stack_bytes=bytearray(0x60),bytearray(0x40),bytearray(0x30)
+    struct.pack_into('<Q',stack_bytes,0,504)
+    struct.pack_into('<Q',stack_bytes,0x28,owner_address)
+    struct.pack_into('<Q',owner_bytes,0x50,table_address)
+    struct.pack_into('<Q',table_bytes,0x18,slab)
+    struct.pack_into('<Q',image,8,owner_address-0x20)
+    index=B('sub',L(8,stackaddr(0x9000)),K(1))
+    offset=B('mul',B('and',index,K(0x7f)),K(0x98))
+    for owner in (L(8,stackaddr(0x9028)),R('rdi')):
+        page=L(8,B('add',L(8,B('add',owner,K(0x50))),B('mul',B('shr',index,K(7)),K(8))))
+        partial=B('add',B('add',page,offset),K(4))
+        a.scan_partials=[partial]
+        if owner==R('rdi'):
+            ins=FakeInsn(f0,'nop','')
+            with redirect_stdout(StringIO()):
+                list(a.rewind([ins],[{}],partial,live={'rdi':owner_address}))
+            assert len(a.scan_partials)==2,a.scan_partials
+        a.pm=ScanMemory([(root,image),(0x9000,stack_bytes),(owner_address,owner_bytes),
+                         (table_address,table_bytes)])
+        regions=[ScanRegion(base,base+0x800,False,True),ScanRegion(root,root+64,True)]
+        output=StringIO()
+        with redirect_stdout(output):
+            assert reverse_pointer_scan(a,regions,slab+0x46ac,ScanOptions(1,0x2000,8),Budget(5),a.modules[0])
+        captured=output.getvalue()
+        assert 'Chain: [[[example.exe+0x808]+0x70]+0x18]+0x46AC' in captured,captured
+        assert 'offsets fixed at the breakpoint' in captured,captured
+    log('[PASS] indexed slab scan from a stack spill or preserved register, beyond the generic offset limit')
+
+    block=bytearray(SCAN_BLOCK+8)
+    struct.pack_into('<Q',block,SCAN_BLOCK-3,0x12350002)
+    memory=ScanMemory([(0,block)])
+    links=[(SCAN_BLOCK-3,ScanTail(0,(-4,)))]
+    for ranges in ([(0,len(block))],[(0,SCAN_BLOCK),(SCAN_BLOCK,len(block))]):
+        for alignment,expected_links in ((1,links),(8,[])):
+            actual_links=list(scan_links(memory,ranges,{0x1234fffe: ScanTail()},set(),
+                                         ScanOptions(1,4,alignment),Budget(10)))
+            assert actual_links==expected_links,actual_links
+    log('[PASS] unaligned scan across read blocks and pointer-value prefix boundaries')
 
     # Actual-history replay: CALL, a spill, reload, RET and the target in caller.
     # This tests recorded path semantics, not the Windows TF event loop itself.
@@ -1692,27 +2686,57 @@ def self_test():
             for ins,stack in zip(reversed(seq),reversed(coord)):
                 expr=actual.transfer(ins,expr,stack)
         assert evaluate(expr,pm,{'rcx':0x2000,'rdx':3})==0x2028,expr
+        vector_store=next(actual.md.disasm(bytes.fromhex('0F 11 00'),0x1000,count=1))
+        actual.instruction=lambda address: vector_store
+        with redirect_stdout(StringIO()):
+            expr,expected=actual.target_expr(0x1000,{'rax':0x4000},0x4004,4)
+        assert expected==0x4004 and evaluate(expr,pm,{'rax':0x4000})==0x4004
         log('[PASS] real Capstone bytes: stack spill/reload + SIB LEA')
+        log('[PASS] real Capstone bytes: float32 watch at +4 inside MOVUPS')
 
 
 def main():
     parser = argparse.ArgumentParser(description='x64 pointer chain candidate tracer')
     parser.add_argument('--self-test', action='store_true')
-    parser.add_argument('--timeout', type=float, default=30, help='cooperative analysis budget in seconds (not breakpoint wait)')
+    parser.add_argument('--timeout', type=float, default=30, help='seconds per analysis stage, excluding breakpoint wait')
     parser.add_argument('--record-from', type=lambda x:int(x,16), help='hex address at which to begin single-step history')
     parser.add_argument('--watch', type=lambda x:int(x,16), help='exact data address (hex); omit to prompt')
     parser.add_argument('--max-steps', type=int, default=20000)
     parser.add_argument('--record-timeout', type=float, default=60)
+    parser.add_argument('--no-scan', action='store_true', help='disable the reverse memory scan after an unresolved trace')
+    parser.add_argument('--scan-depth', type=int, default=6, help='maximum dereferences in a scan candidate (default: 6)')
+    parser.add_argument('--scan-offset', type=lambda x: int(x, 0), default=0x2000,
+                        help='maximum absolute offset per scan step (default: 0x2000)')
+    parser.add_argument('--scan-unaligned', action='store_true', help='also scan pointers stored at non-8-byte-aligned addresses')
+    formats = parser.add_mutually_exclusive_group()
+    formats.add_argument('--type', dest='value_format', metavar='FORMAT',
+                         help='watched value type (default: auto); see --list-types')
+    formats.add_argument('--float32', dest='value_format', action='store_const', const='f32',
+                         help='alias for --type f32')
+    parser.set_defaults(value_format='auto')
+    parser.add_argument('--endian', choices=('little', 'big'), default='little',
+                        help='byte order for value decoding (default: little)')
+    parser.add_argument('--list-types', action='store_true', help='show available value formats')
     args = parser.parse_args()
+    if args.list_types:
+        print(VALUE_FORMATS, end='')
+        return
     if args.self_test:
         self_test()
         return
+    try:
+        value_type = parse_value_type(args.value_format, args.endian)
+    except (ValueError, RecursionError, OverflowError) as error:
+        parser.error(str(error))
     if os.name != 'nt' or C.sizeof(PTR) != 8:
         raise SystemExit('Windows x64 and 64-bit Python required')
     if not math.isfinite(args.timeout) or args.timeout <= 0:
         parser.error('--timeout must be positive')
     if args.max_steps <= 0 or not math.isfinite(args.record_timeout) or args.record_timeout <= 0:
         parser.error('record limits must be positive')
+    if args.scan_depth <= 0 or not 0 <= args.scan_offset <= MASK:
+        parser.error('--scan-depth must be positive and --scan-offset must be an unsigned 64-bit value')
+    scan = None if args.no_scan else ScanOptions(args.scan_depth, args.scan_offset, 1 if args.scan_unaligned else 8)
     import pymem
     api = WinAPI()
     log('========== POINTER CHAIN FINDER ==========')
@@ -1722,8 +2746,10 @@ def main():
     if watch is None:
         watch_text=input('Watch address (hex, Enter = access start): ').strip()
         watch=int(watch_text,16) if watch_text else None
-    if watch is not None and not 0<=watch<=MASK:
-        raise TraceError('Invalid watch address')
+    if watch is not None:
+        watch_size = (value_type.size or 1) if value_type is not None else 1
+        if not 0 <= watch <= MASK or watch+watch_size > MASK+1:
+            raise TraceError('Invalid watch range for the selected value type')
     text = input('Function start (Enter = AUTO): ').strip()
     manual = int(text, 16) if text else None
     if target <= 0 or (manual is not None and not 0 < manual <= target):
@@ -1735,9 +2761,10 @@ def main():
         pm.open_process_from_name(name, exact_match=True)
     try:
         if args.record_from is None:
-            wait_breakpoint(api, pm, target, manual, args.timeout, watch)
+            wait_breakpoint(api, pm, target, manual, args.timeout, watch, scan, value_type)
         else:
-            wait_recorded(api, pm, args.record_from, target, manual, args.timeout, args.max_steps, args.record_timeout, watch)
+            wait_recorded(api, pm, args.record_from, target, manual, args.timeout,
+                          args.max_steps, args.record_timeout, watch, scan, value_type)
     finally:
         pm.close_process()
 
