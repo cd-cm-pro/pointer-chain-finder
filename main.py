@@ -6,7 +6,7 @@ Value formats: python main_v6_types_scan.py --list-types
 import argparse
 from bisect import bisect_left
 import codecs
-from collections import defaultdict
+from collections import defaultdict, deque
 import ctypes as C
 from dataclasses import dataclass, field
 from decimal import Decimal, localcontext
@@ -1000,6 +1000,22 @@ class ProvenanceAnalyzer(Decoder):
         yield from self.predecessor_paths(start,endpoint,decoded,predecessors)
 
     def predecessor_paths(self,start,endpoint,decoded,predecessors):
+        successors=defaultdict(list)
+        for dest,sources in predecessors.items():
+            self.budget.check('CFG path ordering')
+            for source in sources:
+                successors[source].append(dest)
+        distance={start:0}
+        pending=deque([start])
+        while pending:
+            self.budget.check('CFG path ordering')
+            source=pending.popleft()
+            for dest in successors[source]:
+                if dest not in distance:
+                    distance[dest]=distance[source]+1
+                    pending.append(dest)
+        if endpoint not in distance:
+            return
         work=[(endpoint,())]; expansions=0; emitted=0
         while work and emitted<MAX_PATHS and expansions<MAX_PATH_EXPANSIONS:
             self.budget.check('CFG predecessor search')
@@ -1010,8 +1026,9 @@ class ProvenanceAnalyzer(Decoder):
                 continue
             if len(reverse)>=MAX_PATH_LENGTH:
                 continue
-            for pred in predecessors.get(pc,()):
-                if reverse.count(pred)<2:
+            ordered=sorted(predecessors.get(pc,()),key=lambda pred: distance.get(pred,MAX_CFG_NODES),reverse=True)
+            for pred in ordered:
+                if pred in distance and distance[pred]+len(reverse)<MAX_PATH_LENGTH and reverse.count(pred)<2:
                     work.append((pred,reverse+(pred,)))
         if work:
             log('[?] CFG path budget reached; other paths may exist')
@@ -1210,7 +1227,7 @@ class ProvenanceAnalyzer(Decoder):
         log(f'[?] {mode}; snapshot match is not proof of future stability')
 
     def remember_partial(self, expr):
-        if any(part[0]=='stack' for part in leaves(expr)) and expr not in self.scan_partials:
+        if expr not in self.scan_partials and (expr[0] in ('add','load') or next(stack_loads(expr),None) is not None):
             self.scan_partials.append(expr)
             self.scan_partials=self.scan_partials[-MAX_PATHS:]
 
@@ -1331,10 +1348,10 @@ class ScanRegion:
 class ScanTail:
     leading: int = 0
     offsets: tuple = ()
-    from_stack: bool = False
+    from_trace: bool = False
 
     def prepend(self, offset):
-        return ScanTail(0, (offset+self.leading,)+self.offsets, self.from_stack)
+        return ScanTail(0, (offset+self.leading,)+self.offsets, self.from_trace)
 
 
 MAX_SCAN_FRONTIER = 4096
@@ -1386,45 +1403,66 @@ def freeze_stack_loads(expr, pm, cache):
     return B(kind,freeze_stack_loads(expr[1],pm,cache),freeze_stack_loads(expr[2],pm,cache))
 
 
+def scan_trace_tail(analyzer, expr, expected, matched, frontier):
+    node,leading,offsets=expr,0,()
+    while True:
+        while node[0]=='add' and node[2][0]=='const':
+            leading+=signed(node[2][1])
+            node=node[1]
+        if not matched:
+            if leading and node[0] in ('reg','unknown','load','stack'):
+                address=(expected-leading)&MASK
+                if address:
+                    frontier.setdefault(address,ScanTail(leading,(),True))
+            return False
+        if node[0]!='load' or node[1]!=8:
+            break
+        address=evaluate(node,analyzer.pm)
+        if address:
+            frontier.setdefault(address,ScanTail(leading,offsets,True))
+        offsets=(leading,)+offsets
+        leading=0
+        node=node[2]
+    if node[0]=='const' and node[1] and offsets:
+        frontier.setdefault(node[1],ScanTail(leading,offsets,True))
+        if containing(analyzer.modules,node[1]) and analyzer.inspect_candidate(expr,expected):
+            analyzer.report(expr,expected,True,'Module-root candidate grounded in breakpoint values')
+            return True
+    return False
+
+
 def snapshot_scan_seeds(analyzer, expected, budget):
     frontier={expected:ScanTail()}
     cache={}
+    live_bases=getattr(analyzer,'scan_live_bases',())
     for expr in reversed(getattr(analyzer,'scan_partials',())):
-        budget.check('stack-derived scan offsets')
+        budget.check('trace-derived scan offsets')
         try:
             fixed=freeze_stack_loads(expr,analyzer.pm,cache)
+            parts=set(leaves(fixed))
+            unresolved={part[1] for part in parts if part[0]=='reg'}
+            if not unresolved and not any(part[0]=='unknown' for part in parts):
+                if evaluate(fixed,analyzer.pm)==expected and scan_trace_tail(analyzer,fixed,expected,True,frontier):
+                    return None
+                continue
+            scan_trace_tail(analyzer,fixed,expected,False,frontier)
+            if len(unresolved)!=1 or fixed[0] not in ('load','add'):
+                continue
+            register,=unresolved
         except Exception:
             continue
-        try:
-            matches=evaluate(fixed,analyzer.pm)==expected
-        except Exception:
-            matches=False
-        node,leading,offsets=fixed,0,()
-        while node[0]=='load' or (node[0]=='add' and node[2][0]=='const'):
-            if node[0]=='add':
-                leading+=signed(node[2][1])
-                node=node[1]
-            if node[0]=='load' and node[1]==8:
-                # A traced field displacement gives the base even if an
-                # earlier owner pointer is still symbolic.
-                if matches or not offsets:
-                    address=evaluate(node,analyzer.pm) if matches else (expected-leading)&MASK
-                    if address:
-                        frontier.setdefault(address,ScanTail(leading,offsets,True))
-                if not matches:
+        for address in live_bases:
+            budget.check('matching trace against breakpoint addresses')
+            try:
+                grounded=rewrite(fixed,{register:K(address)},[])
+                if evaluate(grounded,analyzer.pm)==expected:
+                    if scan_trace_tail(analyzer,grounded,expected,True,frontier):
+                        return None
                     break
-                offsets=(leading,)+offsets
-                leading=0
-                node=node[2]
-            elif node[0]!='add':
-                break
-        if matches and node[0]=='const' and node[1] and offsets:
-            frontier.setdefault(node[1],ScanTail(leading,offsets,True))
-            if containing(analyzer.modules,node[1]) and analyzer.inspect_candidate(fixed,expected):
-                analyzer.report(fixed,expected,True,'Module-root candidate with stack-derived offsets fixed at the breakpoint')
-                return None
+            except Exception:
+                continue
     if len(frontier)>1:
-        log(f'[scan] Added {len(frontier)-1} target address(es) using traced stack-derived offsets')
+        log(f'[scan] Added {len(frontier)-1} target address(es) using traced offsets and breakpoint values')
     return frontier
 
 
@@ -1526,13 +1564,14 @@ def reverse_pointer_scan(analyzer, regions, expected, options, budget, preferred
             for offset in tail.offsets:
                 expr=B('add',L(8,expr),K(offset))
             if analyzer.inspect_candidate(expr,expected):
-                mode=('Reverse scan with stack-derived offsets fixed at the breakpoint'
-                      if tail.from_stack else 'Reverse memory scan candidate')
+                mode=('Reverse scan with traced offsets fixed at the breakpoint'
+                      if tail.from_trace else 'Reverse memory scan candidate')
                 analyzer.report(expr,expected,True,mode)
                 return True
         return False
 
     primary_budget=Budget(max(0,budget.end-time.monotonic())*0.85) if roots and remaining_roots else budget
+    following={}
     try:
         for depth in range(1, options.depth + 1):
             primary_budget.check('pointer scan depth')
@@ -1540,13 +1579,13 @@ def reverse_pointer_scan(analyzer, regions, expected, options, budget, preferred
             deferred_targets.update(frontier)
             if roots and check_roots(roots,frontier,'writable module data',primary_budget):
                 return True
+            following={}
             if depth==1 and not roots and remaining_roots:
                 if check_roots(remaining_roots,frontier,'readable module regions',primary_budget):
                     return True
                 deferred_targets.clear()
             if depth == options.depth:
                 break
-            following = {}
             for slot,tail in scan_links(analyzer.pm,other_ranges,frontier,visited,options,primary_budget,'non-module regions'):
                 following.setdefault(slot,tail)
                 if len(following) >= MAX_SCAN_FRONTIER:
@@ -1559,6 +1598,11 @@ def reverse_pointer_scan(analyzer, regions, expected, options, budget, preferred
     except TraceError:
         if primary_budget is budget or time.monotonic()<primary_budget.end:
             raise
+        if following:
+            log(f'[scan] Checking {len(following):,} heap link(s) collected before the deadline')
+            deferred_targets.update(following)
+            if roots and check_roots(roots,following,'writable module data for collected links',budget):
+                return True
         log('[scan] Moving to the remaining module regions')
     if remaining_roots and deferred_targets:
         if check_roots(remaining_roots,deferred_targets,'remaining module regions',budget):
@@ -1794,6 +1838,8 @@ def resolve_hit(api, analyzer, regs, target, watch, trace, seconds, scan, value_
     if scan and expected is not None:
         budget = Budget(seconds)
         try:
+            captured=tuple(regs.values())+getattr(analyzer,'scan_stack_values',())
+            analyzer.scan_live_bases=tuple(dict.fromkeys(value for value in captured if 0x10000<=value<=MASK))
             regions = api.readable_regions(analyzer.pm.process_handle, budget)
             return reverse_pointer_scan(analyzer, regions, expected, scan, budget,
                                         containing(analyzer.modules,target))
@@ -1810,12 +1856,14 @@ def analyze_hit(api, pm, thread, context, target, manual, seconds, watch=None, s
         log(f'{name.upper():3} = 0x{value:016X}')
     modules = get_modules(pm)
     log('\n========== STACK MEMORY ==========')
+    stack_values=[]
     for i in range(16):
         budget.check('stack memory')
         try:
             value = u64(pm, regs['rsp'] + 8 * i)
         except Exception:
             continue
+        stack_values.append(value)
         log(f'RSP+0x{i * 8:02X} | 0x{value:016X} | {label(modules, value)}')
     try:
         frames = api.stack(pm, thread, context, budget)
@@ -1826,6 +1874,7 @@ def analyze_hit(api, pm, thread, context, target, manual, seconds, watch=None, s
     for i, frame in enumerate(frames):
         log(f'#{i:02d} {label(modules, frame["rip"])} RSP=0x{frame["rsp"]:X}')
     analyzer = ProvenanceAnalyzer(pm, modules, budget)
+    analyzer.scan_stack_values=tuple(stack_values)
     watch_range = value_type.watch_range if value_type is not None else (1, 0)
     resolve_hit(api, analyzer, regs, target, watch,
                 lambda: analyzer.trace(frames, regs, target, manual, watch, *watch_range), seconds, scan, value_type)
@@ -2481,6 +2530,13 @@ def self_test():
     assert 'Chain: [example.exe+0x808]+0x120' in output.getvalue(),output.getvalue()
     log('[PASS] conditional CFG predecessor paths and snapshot validation')
 
+    entry,join,branch,backedge,end=0x1000,0x1010,0x1020,0x1030,0x1040
+    decoded={pc:FakeInsn(pc,'nop','') for pc in (entry,join,branch,backedge)}
+    incoming={join:[entry,backedge],branch:[entry],backedge:[join,branch],end:[join,backedge]}
+    path=next(MockAnalyzer().predecessor_paths(entry,end,decoded,incoming))
+    assert [ins.address for ins in path]==[entry,join]
+    log('[PASS] CFG tests a short entry-reaching path before longer loop alternatives')
+
     # A completed call supplies RAX to a SIMD store. The first RET path has
     # another result; only the second agrees with the watched byte at +4.
     target=f1+9
@@ -2629,6 +2685,45 @@ def self_test():
         assert 'Chain: [[[example.exe+0x808]+0x70]+0x18]+0x46AC' in captured,captured
         assert 'offsets fixed at the breakpoint' in captured,captured
     log('[PASS] indexed slab scan from a stack spill or preserved register, beyond the generic offset limit')
+
+    # A partial with a register root can still contribute its outer offset.
+    struct.pack_into('<Q',owner_bytes,0x18,slab)
+    a.scan_partials=[]
+    a.scan_live_bases=()
+    a.remember_partial(B('add',L(8,B('add',R('rcx'),K(0x18))),K(0x11c)))
+    output=StringIO()
+    with redirect_stdout(output):
+        seeds=snapshot_scan_seeds(a,slab+0x11c,Budget(5))
+    assert seeds[slab]==ScanTail(0x11c,(),True),seeds
+    a.scan_live_bases=(0x470000,owner_address)
+    with redirect_stdout(output):
+        assert reverse_pointer_scan(a,regions,slab+0x11c,ScanOptions(1,0x2000,8),Budget(5))
+    assert 'Chain: [[example.exe+0x808]+0x38]+0x11C' in output.getvalue(),output.getvalue()
+    log('[PASS] stack-free trace seeds and exact watch validation from a captured base')
+
+    # A deadline while expanding the heap must not discard links already read.
+    from unittest.mock import patch
+    a.scan_partials=[]
+    a.scan_live_bases=()
+    struct.pack_into('<Q',image,8,0x7070)
+    a.pm=ScanMemory([(root,image),(0x7040,heap),(0x4000,watched)])
+    regions=[ScanRegion(base,root),ScanRegion(root,root+64,True),
+             ScanRegion(0x4000,0x4040,True),ScanRegion(0x7040,0x7080,True)]
+    actual_scan_links=scan_links
+
+    def interrupted_scan(pm,ranges,frontier,visited,options,budget,phase=None):
+        for match in actual_scan_links(pm,ranges,frontier,visited,options,budget,phase):
+            yield match
+            if phase=='non-module regions':
+                budget.end=time.monotonic()-1
+                budget.check('simulated heap deadline')
+
+    with patch.dict(globals(),scan_links=interrupted_scan), redirect_stdout(StringIO()) as output:
+        assert reverse_pointer_scan(a,regions,0x4004,ScanOptions(2,0x10,8),Budget(5))
+    captured=output.getvalue()
+    assert 'heap link(s) collected before the deadline' in captured,captured
+    assert 'Chain: [[example.exe+0x808]-0x10]+0x4' in captured,captured
+    log('[PASS] heap links already found are checked when the primary scan expires')
 
     block=bytearray(SCAN_BLOCK+8)
     struct.pack_into('<Q',block,SCAN_BLOCK-3,0x12350002)
