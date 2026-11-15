@@ -34,7 +34,7 @@ pip install pymem capstone
 ## Usage
 
 ```bash
-python main_v5.py
+python main.py
 ```
 
 Enter the following information when prompted:
